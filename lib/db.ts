@@ -1,0 +1,85 @@
+import { Database } from "bun:sqlite";
+import { homedir } from "os";
+import { join } from "path";
+import { mkdirSync, existsSync } from "fs";
+
+// Store the DB in ~/.tron-wallet-cli/wallet.db by default so it's not tied
+// to whatever directory you happen to run the command from.
+const DATA_DIR = process.env.WALLET_DATA_DIR || join(homedir(), ".tron-wallet-cli");
+if (!existsSync(DATA_DIR)) {
+  mkdirSync(DATA_DIR, { recursive: true });
+}
+
+const DB_PATH = join(DATA_DIR, "wallet.db");
+const db = new Database(DB_PATH);
+
+// If this DB file lives in a synced cloud folder (Proton Drive, Dropbox, etc.),
+// avoid WAL mode: it creates -wal/-shm sidecar files that can desync or
+// corrupt if the sync client uploads mid-write. DELETE mode keeps everything
+// in the single .db file and is the safer choice for a synced folder.
+db.run(`PRAGMA journal_mode = DELETE;`);
+db.run(`PRAGMA synchronous = FULL;`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS profiles (
+    name TEXT PRIMARY KEY,
+    address TEXT NOT NULL,
+    private_key TEXT NOT NULL,
+    encrypted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )
+`);
+
+export interface Profile {
+  name: string;
+  address: string;
+  private_key: string;
+  encrypted: number;
+  created_at: string;
+}
+
+export function insertProfile(profile: Omit<Profile, "created_at">) {
+  db.run(
+    `INSERT INTO profiles (name, address, private_key, encrypted, created_at) VALUES (?, ?, ?, ?, ?)`,
+    [profile.name, profile.address, profile.private_key, profile.encrypted, new Date().toISOString()]
+  );
+}
+
+export function getProfile(name: string): Profile | null {
+  const row = db.query(`SELECT * FROM profiles WHERE name = ?`).get(name) as Profile | null;
+  return row ?? null;
+}
+
+export function listProfiles(): Profile[] {
+  return db.query(`SELECT * FROM profiles ORDER BY created_at ASC`).all() as Profile[];
+}
+
+export function deleteProfile(name: string) {
+  db.run(`DELETE FROM profiles WHERE name = ?`, [name]);
+}
+
+export function setSetting(key: string, value: string) {
+  db.run(
+    `INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [key, value]
+  );
+}
+
+export function getSetting(key: string): string | null {
+  const row = db.query(`SELECT value FROM settings WHERE key = ?`).get(key) as { value: string } | null;
+  return row?.value ?? null;
+}
+
+export function getActiveProfileName(): string | null {
+  return getSetting("active_profile");
+}
+
+export { DB_PATH };

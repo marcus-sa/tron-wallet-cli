@@ -1,0 +1,16 @@
+{
+  "name": "tron-wallet-cli-bun",
+  "version": "1.0.0",
+  "description": "Multi-profile Tron wallet CLI (Bun + bun:sqlite) for generating keypairs and sending TRX / TRC-20 USDT",
+  "module": "index.ts",
+  "type": "module",
+  "bin": {
+    "tron-wallet": "./index.ts"
+  },
+  "scripts": {
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "tronweb": "^5.3.2"
+  }
+}
