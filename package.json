@@ -11,6 +11,10 @@
     "start": "bun index.ts"
   },
   "dependencies": {
+    "qrcode": "^1.5.4",
     "tronweb": "^5.3.2"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6"
   }
 }

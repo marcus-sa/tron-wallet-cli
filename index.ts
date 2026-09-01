@@ -11,6 +11,7 @@
  *   bun index.ts profile list
  *   bun index.ts profile use <name>
  *   bun index.ts profile show <name> [--reveal]
+ *   bun index.ts profile qr [name]
  *   bun index.ts profile remove <name>
  *
  *   bun index.ts balance [name]                 (defaults to active profile)
@@ -35,6 +36,7 @@ import {
 } from "./lib/db";
 import { encryptSecret, decryptSecret, isEncryptionEnabled } from "./lib/crypto";
 import { buildTronWeb, generateKeypair, USDT_CONTRACT } from "./lib/tron";
+import { renderQrToTerminal } from "./lib/qr";
 
 function printUsage() {
   console.log(`
@@ -46,6 +48,7 @@ Profile commands:
   profile list                        List all profiles (marks the active one)
   profile use <name>                  Set the active profile
   profile show <name> [--reveal]      Show a profile's address (and key with --reveal)
+  profile qr [name]                   Render the address as a scannable QR code
   profile remove <name>               Delete a profile
 
 Wallet commands:
@@ -168,9 +171,9 @@ function cmdProfileUse(name?: string) {
   console.log(`Active profile set to "${name}"`);
 }
 
-function cmdProfileShow(name?: string, reveal = false) {
+function cmdProfileShow(name?: string, reveal = false, qr = false) {
   if (!name) {
-    console.error("Usage: profile show <name> [--reveal]");
+    console.error("Usage: profile show <name> [--reveal] [--qr]");
     process.exit(1);
   }
   const profile = requireProfile(name);
@@ -181,6 +184,18 @@ function cmdProfileShow(name?: string, reveal = false) {
   if (reveal) {
     console.log(`  Private key: ${getPrivateKeyPlaintext(profile)}`);
   }
+  if (qr) {
+    console.log();
+    console.log(renderQrToTerminal(profile.address));
+  }
+}
+
+function cmdProfileQr(nameArg?: string) {
+  const name = resolveProfileName(nameArg);
+  const profile = requireProfile(name);
+  console.log(`${profile.name}: ${profile.address}`);
+  console.log();
+  console.log(renderQrToTerminal(profile.address));
 }
 
 function cmdProfileRemove(name?: string) {
@@ -202,6 +217,9 @@ async function cmdBalance(nameArg?: string) {
   const name = resolveProfileName(nameArg);
   const profile = requireProfile(name);
   const tronWeb = buildTronWeb();
+  // Constant-contract calls (balanceOf) require an owner_address; without a
+  // private key the only address we have is the profile's own.
+  tronWeb.setAddress(profile.address);
 
   const sunBalance = await tronWeb.trx.getBalance(profile.address);
   console.log(`Profile: ${profile.name} (${profile.address})`);
@@ -298,9 +316,13 @@ async function main() {
           break;
         case "show": {
           const { present: reveal, rest: rest2 } = hasFlag(rest, "--reveal");
-          cmdProfileShow(rest2[0], reveal);
+          const { present: qr, rest: rest3 } = hasFlag(rest2, "--qr");
+          cmdProfileShow(rest3[0], reveal, qr);
           break;
         }
+        case "qr":
+          cmdProfileQr(rest[0]);
+          break;
         case "remove":
           cmdProfileRemove(rest[0]);
           break;
