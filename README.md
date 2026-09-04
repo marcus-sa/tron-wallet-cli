@@ -46,6 +46,19 @@ bun index.ts profile remove bob
 bun index.ts balance
 bun index.ts balance alice
 
+# Show transaction history (aliases: txs, history)
+bun index.ts transactions
+bun index.ts transactions alice
+
+# Last 100 instead of the default 20, or the complete history
+bun index.ts transactions --limit 100
+bun index.ts transactions --all
+
+# Filter by type, or get machine-readable output
+bun index.ts transactions --type usdt
+bun index.ts transactions --type trx
+bun index.ts transactions --json
+
 # Send TRX / USDT using the active profile
 bun index.ts send-trx <toAddress> <amount>
 bun index.ts send-usdt <toAddress> <amount>
@@ -54,6 +67,31 @@ bun index.ts send-usdt <toAddress> <amount>
 bun index.ts send-trx <toAddress> <amount> --profile alice
 bun index.ts send-usdt <toAddress> <amount> --profile alice
 ```
+
+### Transaction history
+
+`transactions` reads history from TronGrid's v1 REST API — TronWeb itself
+only exposes single-transaction lookups, with no "list this account's
+transactions" call. Two endpoints are merged: native transactions (TRX
+transfers, contract calls, staking) and TRC-20 transfer events. A USDT send
+appears in both, so the native row is dropped when the TRC-20 stream already
+described that txID with real token amounts.
+
+| Option | Meaning |
+| --- | --- |
+| `--limit <n>` | Number of transactions to show (default 20) |
+| `--all` | Fetch the complete history with no limit |
+| `--type <trx\|usdt\|trc20\|all>` | Filter by transfer type (default `all`) |
+| `--json` | Print raw JSON instead of the table |
+| `--profile <name>` | Profile to use, instead of the active one |
+
+Filters are applied while paging, so `--type trx` keeps looking until it has
+`--limit` actual TRX transfers rather than filtering one page and giving up.
+Filtered scans stop after 5,000 transactions unless you pass `--all`.
+
+If `TRON_FULL_HOST` points at a self-hosted full node, set `TRONGRID_API_HOST`
+as well — a bare node serves no `/v1` routes, so history lookups need a
+TronGrid host.
 
 ## Storing the DB on Proton Drive (macOS)
 

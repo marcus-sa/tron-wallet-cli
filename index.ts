@@ -15,6 +15,7 @@
  *   bun index.ts profile remove <name>
  *
  *   bun index.ts balance [name]                 (defaults to active profile)
+ *   bun index.ts transactions [name] [--limit N] [--all] [--type trx|usdt|trc20|all] [--json]
  *   bun index.ts send-trx <to> <amount> [--profile name]
  *   bun index.ts send-usdt <to> <amount> [--profile name]
  *
@@ -22,6 +23,7 @@
  *   WALLET_MASTER_KEY   optional passphrase to encrypt private keys at rest
  *   TRONGRID_API_KEY    optional, recommended for higher rate limits
  *   TRON_FULL_HOST      optional, defaults to https://api.trongrid.io
+ *   TRONGRID_API_HOST   optional, host for the v1 REST API (tx history)
  *   WALLET_DATA_DIR     optional, defaults to ~/.tron-wallet-cli
  */
 
@@ -37,6 +39,7 @@ import {
 import { encryptSecret, decryptSecret, isEncryptionEnabled } from "./lib/crypto";
 import { buildTronWeb, generateKeypair, USDT_CONTRACT } from "./lib/tron";
 import { renderQrToTerminal } from "./lib/qr";
+import { fetchHistory, type HistoryEntry } from "./lib/history";
 
 function printUsage() {
   console.log(`
@@ -53,6 +56,12 @@ Profile commands:
 
 Wallet commands:
   balance [name]                      Show TRX + USDT balance (active profile if omitted)
+  transactions [name] [options]       Show transaction history (aliases: txs, history)
+      --limit <n>                       Number of transactions to show (default 20)
+      --all                             Fetch the complete history, no limit
+      --type <trx|usdt|trc20|all>       Filter by transfer type (default all)
+      --json                            Print raw JSON instead of a table
+      --profile <name>                  Profile to use
   send-trx <to> <amount> [--profile name]
   send-usdt <to> <amount> [--profile name]
 
@@ -230,6 +239,87 @@ async function cmdBalance(nameArg?: string) {
   console.log(`  USDT: ${usdtRaw.toNumber() / 1_000_000}`);
 }
 
+interface TransactionsOptions {
+  limit: number;
+  type: string;
+  json: boolean;
+}
+
+function formatWhen(timestamp: number): string {
+  const d = new Date(timestamp);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function signedAmount(entry: HistoryEntry): string {
+  if (entry.amount === null) return "—";
+  if (entry.direction === "self") return entry.amount;
+  return `${entry.direction === "out" ? "-" : "+"}${entry.amount}`;
+}
+
+function printHistoryTable(entries: HistoryEntry[]) {
+  // The status column is dead weight when nothing failed, and dropping it buys
+  // back the width that the full 64-char txID needs. Truncating the txID
+  // instead would be worse: a partial hash can't be pasted into an explorer.
+  const showStatus = entries.some((e) => e.status !== "SUCCESS");
+
+  const rows = entries.map((e) => [
+    formatWhen(e.timestamp),
+    e.direction.toUpperCase(),
+    e.kind,
+    signedAmount(e),
+    e.counterparty || "—",
+    ...(showStatus ? [e.status] : []),
+    e.txId,
+  ]);
+
+  const header = ["WHEN", "DIR", "TYPE", "AMOUNT", "COUNTERPARTY", ...(showStatus ? ["STATUS"] : []), "TXID"];
+  // Amount reads best right-aligned so decimal points line up.
+  const rightAligned = new Set([3]);
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
+
+  const renderRow = (cells: string[]) =>
+    "  " +
+    cells
+      .map((cell, i) => (i === cells.length - 1 ? cell : rightAligned.has(i) ? cell.padStart(widths[i]!) : cell.padEnd(widths[i]!)))
+      .join("  ");
+
+  console.log(renderRow(header));
+  for (const row of rows) {
+    console.log(renderRow(row));
+  }
+}
+
+async function cmdTransactions(nameArg?: string, options: TransactionsOptions = { limit: 20, type: "all", json: false }) {
+  const name = resolveProfileName(nameArg);
+  const profile = requireProfile(name);
+
+  const entries = await fetchHistory(profile.address, { limit: options.limit, type: options.type });
+
+  if (options.json) {
+    console.log(JSON.stringify(entries, null, 2));
+    return;
+  }
+
+  const scope = options.type === "all" ? "" : ` [${options.type}]`;
+  console.log(`Transactions for "${profile.name}" (${profile.address})${scope}`);
+
+  if (entries.length === 0) {
+    console.log("  No transactions found.");
+    return;
+  }
+
+  console.log();
+  printHistoryTable(entries);
+  console.log();
+
+  const reachedLimit = Number.isFinite(options.limit) && entries.length >= options.limit;
+  console.log(
+    `  ${entries.length} transaction${entries.length === 1 ? "" : "s"}` +
+      (reachedLimit ? ` (limit reached — use --limit <n> or --all for more)` : "")
+  );
+}
+
 async function cmdSendTrx(toAddress?: string, amountStr?: string, profileName?: string) {
   if (!toAddress || !amountStr) {
     console.error("Usage: send-trx <toAddress> <amount> [--profile name]");
@@ -335,6 +425,42 @@ async function main() {
     if (command === "balance") {
       const { value: profileFlag, rest: rest2 } = extractFlag([sub, ...rest].filter(Boolean) as string[], "--profile");
       await cmdBalance(profileFlag || rest2[0]);
+      return;
+    }
+
+    if (command === "transactions" || command === "txs" || command === "history") {
+      let args = [sub, ...rest].filter(Boolean) as string[];
+
+      const profileFlag = extractFlag(args, "--profile");
+      args = profileFlag.rest;
+      const limitFlag = extractFlag(args, "--limit");
+      args = limitFlag.rest;
+      const typeFlag = extractFlag(args, "--type");
+      args = typeFlag.rest;
+      const allFlag = hasFlag(args, "--all");
+      args = allFlag.rest;
+      const jsonFlag = hasFlag(args, "--json");
+      args = jsonFlag.rest;
+
+      let limit = 20;
+      if (allFlag.present) {
+        limit = Infinity;
+      } else if (limitFlag.value !== undefined) {
+        limit = parseInt(limitFlag.value, 10);
+        if (Number.isNaN(limit) || limit <= 0) {
+          console.error("--limit must be a positive integer.");
+          process.exit(1);
+        }
+      }
+
+      const type = (typeFlag.value ?? "all").toLowerCase();
+      const allowedTypes = ["all", "trx", "trc20", "usdt"];
+      if (!allowedTypes.includes(type)) {
+        console.error(`--type must be one of: ${allowedTypes.join(", ")}`);
+        process.exit(1);
+      }
+
+      await cmdTransactions(profileFlag.value || args[0], { limit, type, json: jsonFlag.present });
       return;
     }
 
