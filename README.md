@@ -66,6 +66,13 @@ bun index.ts send-usdt <toAddress> <amount>
 # Or specify a profile explicitly
 bun index.ts send-trx <toAddress> <amount> --profile alice
 bun index.ts send-usdt <toAddress> <amount> --profile alice
+
+# Check the current rate without swapping anything
+bun index.ts swap trx-usdt 100 --quote
+
+# Swap 100 TRX for USDT, or 50 USDT back to TRX
+bun index.ts swap trx-usdt 100
+bun index.ts swap usdt-trx 50
 ```
 
 ### Transaction history
@@ -92,6 +99,54 @@ Filtered scans stop after 5,000 transactions unless you pass `--all`.
 If `TRON_FULL_HOST` points at a self-hosted full node, set `TRONGRID_API_HOST`
 as well — a bare node serves no `/v1` routes, so history lookups need a
 TronGrid host.
+
+### Swapping TRX <-> USDT
+
+`swap` trades against [SunSwap V2](https://sunswap.com/), Tron's Uniswap-V2
+fork, by calling its router contract directly — no exchange account, no API
+key, and the funds never leave the profile's address.
+
+```bash
+# Always free to ask: a constant call, nothing is signed or sent
+bun index.ts swap trx-usdt 100 --quote
+
+bun index.ts swap trx-usdt 100 --slippage 1
+bun index.ts swap usdt-trx 50 --profile alice
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--quote` | Print the current rate and exit without swapping |
+| `--slippage <percent>` | Maximum acceptable slippage (default `0.5`) |
+| `--reserve <trx>` | TRX held back to pay fees (default `30`) |
+| `--deadline <minutes>` | How long the swap stays valid on-chain (default `10`) |
+| `--profile <name>` | Profile to use, instead of the active one |
+
+Each swap quotes the router with `getAmountsOut`, converts that quote into an
+`amountOutMin` using `--slippage`, and only then signs. The minimum is what
+stops a sandwich bot from taking the trade at an arbitrary price — a swap that
+would land below it reverts instead of executing.
+
+Direction matters for what actually happens on-chain:
+
+- **`trx-usdt`** sends native TRX as the call's value, so it's a single
+  transaction with no allowance step.
+- **`usdt-trx`** is a TRC-20 spend, so the router needs an allowance first.
+  The CLI checks the current allowance and only sends an `approve` when it
+  falls short — and clears a stale non-zero allowance first, since Tether-style
+  tokens reject a non-zero to non-zero approval outright. That makes it up to
+  three transactions.
+
+After sending, the CLI waits for the receipt rather than trusting the txID:
+`send()` resolves as soon as a node accepts the transaction, which says nothing
+about whether it executed. The final "received" figure is read out of the
+receipt logs (the token's `Transfer` event, or WTRX's `Withdrawal` for TRX out),
+so it's the amount that actually arrived, not the pre-trade quote.
+
+The `--reserve` default keeps 30 TRX back on `trx-usdt` swaps. Swapping a whole
+balance leaves nothing to pay the next transaction's bandwidth and energy with,
+which is an easy way to strand an account. Set `--reserve 0` if you know what
+you're doing.
 
 ## Storing the DB on Proton Drive (macOS)
 
@@ -170,5 +225,6 @@ tron-wallet profile list
   Tron transactions consume TRX for bandwidth/energy.
 - `feeLimit` in send-usdt is a cap, not a fixed cost — typical TRC-20
   transfers burn a few TRX worth of energy unless the account has
-  pre-staked energy.
+  pre-staked energy. Swaps use a higher cap (100 TRX) because they touch
+  the router, the pool and the TRX wrapper in one transaction.
 - Never commit `.env`, the SQLite DB file, or logs containing revealed keys.

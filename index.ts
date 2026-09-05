@@ -18,6 +18,7 @@
  *   bun index.ts transactions [name] [--limit N] [--all] [--type trx|usdt|trc20|all] [--json]
  *   bun index.ts send-trx <to> <amount> [--profile name]
  *   bun index.ts send-usdt <to> <amount> [--profile name]
+ *   bun index.ts swap <trx-usdt|usdt-trx> <amount> [--slippage n] [--quote]
  *
  * Env vars:
  *   WALLET_MASTER_KEY   optional passphrase to encrypt private keys at rest
@@ -40,6 +41,20 @@ import { encryptSecret, decryptSecret, isEncryptionEnabled } from "./lib/crypto"
 import { buildTronWeb, generateKeypair, USDT_CONTRACT } from "./lib/tron";
 import { renderQrToTerminal } from "./lib/qr";
 import { fetchHistory, type HistoryEntry } from "./lib/history";
+import {
+  DEFAULT_TRX_RESERVE,
+  ensureUsdtAllowance,
+  executeSwap,
+  isSwapDirection,
+  planSwap,
+  quoteSwap,
+  receiptError,
+  receiptSucceeded,
+  receivedAmount,
+  tokensFor,
+  waitForReceipt,
+  type SwapDirection,
+} from "./lib/swap";
 
 function printUsage() {
   console.log(`
@@ -64,6 +79,12 @@ Wallet commands:
       --profile <name>                  Profile to use
   send-trx <to> <amount> [--profile name]
   send-usdt <to> <amount> [--profile name]
+  swap <trx-usdt|usdt-trx> <amount> [options]
+      --quote                           Print the current rate without swapping
+      --slippage <percent>              Max acceptable slippage (default 0.5)
+      --reserve <trx>                   TRX held back for fees (default ${DEFAULT_TRX_RESERVE})
+      --deadline <minutes>              Swap expiry (default 10)
+      --profile <name>                  Profile to use
 
 Encryption: ${isEncryptionEnabled() ? "ENABLED (WALLET_MASTER_KEY set)" : "disabled (set WALLET_MASTER_KEY to encrypt keys at rest)"}
 `);
@@ -368,6 +389,109 @@ async function cmdSendUsdt(toAddress?: string, amountStr?: string, profileName?:
   console.log("Transaction ID:", tx);
 }
 
+interface SwapOptions {
+  slippage: number;
+  reserve: number;
+  deadline: number;
+  quoteOnly: boolean;
+  profile?: string;
+}
+
+async function cmdSwap(direction: SwapDirection, amountStr?: string, options?: SwapOptions) {
+  const opts = options!;
+  const tokens = tokensFor(direction);
+
+  if (!amountStr) {
+    console.error(`Usage: swap ${direction} <amount> [--slippage n] [--quote] [--profile name]`);
+    process.exit(1);
+  }
+  const amount = parseFloat(amountStr);
+  if (Number.isNaN(amount) || amount <= 0) {
+    console.error("Amount must be a positive number.");
+    process.exit(1);
+  }
+
+  const name = resolveProfileName(opts.profile);
+  const profile = requireProfile(name);
+
+  if (opts.quoteOnly) {
+    const tronWeb = buildTronWeb();
+    // getAmountsOut is a constant call, which still needs an owner address.
+    tronWeb.setAddress(profile.address);
+    const out = await quoteSwap(tronWeb, direction, amount);
+    console.log(`${amount} ${tokens.in} → ${out} ${tokens.out}`);
+    console.log(`  Rate: 1 ${tokens.in} = ${out / amount} ${tokens.out}`);
+    console.log(`  Quote only — nothing was sent.`);
+    return;
+  }
+
+  const privateKey = getPrivateKeyPlaintext(profile);
+  const tronWeb = buildTronWeb(privateKey);
+  const trxBalance = Number(tronWeb.fromSun(await tronWeb.trx.getBalance(profile.address)));
+
+  if (direction === "trx-usdt") {
+    const spendable = trxBalance - opts.reserve;
+    if (amount > spendable) {
+      console.error(`Not enough TRX. Balance ${trxBalance}, reserved ${opts.reserve} for fees.`);
+      if (spendable > 0) {
+        console.error(`Most you can swap right now: ${spendable} TRX (or lower the reserve with --reserve).`);
+      } else {
+        console.error(opts.reserve > 0 ? "Fund the account, or lower the reserve with --reserve." : "Fund the account first.");
+      }
+      process.exit(1);
+    }
+  } else {
+    const usdt = await tronWeb.contract().at(USDT_CONTRACT);
+    const usdtBalance = Number((await usdt.methods.balanceOf(profile.address).call()).toString()) / 1_000_000;
+    if (amount > usdtBalance) {
+      console.error(`Not enough USDT. Balance ${usdtBalance}.`);
+      process.exit(1);
+    }
+    // A USDT-in swap costs an approval plus the swap, both paid in energy.
+    if (trxBalance === 0) {
+      console.error("Account holds no TRX — there is nothing to pay the swap's energy with.");
+      process.exit(1);
+    }
+    if (trxBalance < 15) {
+      console.log(`  Warning: only ${trxBalance} TRX for fees; the swap may run out of energy.`);
+    }
+  }
+
+  const plan = await planSwap(tronWeb, direction, amount, opts.slippage);
+
+  console.log(`Swapping from profile "${profile.name}" (${profile.address})`);
+  console.log(`  In:       ${plan.amountIn} ${tokens.in}`);
+  console.log(`  Expected: ${plan.expectedOut} ${tokens.out}`);
+  console.log(`  Minimum:  ${plan.minOut} ${tokens.out} (${plan.slippagePercent}% slippage)`);
+
+  if (direction === "usdt-trx") {
+    const approvalTx = await ensureUsdtAllowance(tronWeb, profile.address, amount);
+    if (approvalTx) {
+      console.log(`  Approved router to spend USDT: ${approvalTx}`);
+    }
+  }
+
+  const txId = await executeSwap(tronWeb, plan, profile.address, opts.deadline);
+  console.log(`  Transaction ID: ${txId}`);
+
+  const info = await waitForReceipt(tronWeb, txId);
+  if (!info) {
+    console.log("  Still unconfirmed after 90s — check the txID in an explorer.");
+    return;
+  }
+  if (!receiptSucceeded(info)) {
+    console.error(`  Swap failed on-chain: ${receiptError(info)}`);
+    process.exit(1);
+  }
+
+  const received = receivedAmount(tronWeb, info, direction, profile.address);
+  console.log(
+    received === null
+      ? `  Confirmed (could not read the received amount from the receipt).`
+      : `  Confirmed — received ${received} ${tokens.out}`
+  );
+}
+
 // --- arg parsing ------------------------------------------------------
 
 function extractFlag(args: string[], flag: string): { value: string | undefined; rest: string[] } {
@@ -475,6 +599,53 @@ async function main() {
       const args = [sub, ...rest].filter(Boolean) as string[];
       const { value: profileFlag, rest: rest2 } = extractFlag(args, "--profile");
       await cmdSendUsdt(rest2[0], rest2[1], profileFlag);
+      return;
+    }
+
+    if (command === "swap") {
+      let args = [sub, ...rest].filter(Boolean) as string[];
+
+      const profileFlag = extractFlag(args, "--profile");
+      args = profileFlag.rest;
+      const slippageFlag = extractFlag(args, "--slippage");
+      args = slippageFlag.rest;
+      const reserveFlag = extractFlag(args, "--reserve");
+      args = reserveFlag.rest;
+      const deadlineFlag = extractFlag(args, "--deadline");
+      args = deadlineFlag.rest;
+      const quoteFlag = hasFlag(args, "--quote");
+      args = quoteFlag.rest;
+
+      const direction = (args[0] ?? "").toLowerCase();
+      if (!isSwapDirection(direction)) {
+        console.error("Usage: swap <trx-usdt|usdt-trx> <amount> [options]");
+        process.exit(1);
+      }
+
+      const numericFlag = (raw: string | undefined, fallback: number, label: string, allowZero = false) => {
+        if (raw === undefined) return fallback;
+        const value = parseFloat(raw);
+        if (Number.isNaN(value) || value < 0 || (!allowZero && value === 0)) {
+          console.error(`${label} must be a positive number.`);
+          process.exit(1);
+        }
+        return value;
+      };
+
+      // 0 is a valid, if impractical, slippage: it pins minOut to the quote.
+      const slippage = numericFlag(slippageFlag.value, 0.5, "--slippage", true);
+      if (slippage >= 100) {
+        console.error("--slippage must be below 100.");
+        process.exit(1);
+      }
+
+      await cmdSwap(direction, args[1], {
+        slippage,
+        reserve: numericFlag(reserveFlag.value, DEFAULT_TRX_RESERVE, "--reserve", true),
+        deadline: numericFlag(deadlineFlag.value, 10, "--deadline"),
+        quoteOnly: quoteFlag.present,
+        profile: profileFlag.value,
+      });
       return;
     }
 
